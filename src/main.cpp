@@ -1,4 +1,5 @@
 #include <Arduino.h>
+#include <stdlib.h>
 
 #define DATA0_PIN 2  // INT0
 #define DATA1_PIN 3  // INT1
@@ -13,14 +14,28 @@ const unsigned long PARTIAL_TIMEOUT_MS  = 200;   // timeout frame incompleto
 const unsigned long SEND_INTERVAL_MS    = 10000; // ENVIAR 1 tag cada 10 s
 const unsigned long DUP_WINDOW_MS       = 300;   // evita duplicado pegado
 
+// ---------- Debounce/Deadtime en flancos ----------
+#define USE_DEADTIME 1
+const unsigned long DEADTIME_US = 200;
+
+volatile unsigned long lastEdgeUs = 0;
+inline bool acceptEdge() {
+#if USE_DEADTIME
+  unsigned long now = micros();
+  if (now - lastEdgeUs < DEADTIME_US) return false;
+  lastEdgeUs = now;
+#endif
+  return true;
+}
+
 // ---------- Wiegand bit buffer ----------
 volatile char bitBuffer[27];   // 26 bits + '\0'
 volatile byte bitIndex = 0;
 volatile unsigned long lastBitTimeMs = 0;
 
 // ---------- Cola circular de tags ----------
-const uint16_t QUEUE_SIZE = 256;                 // tamaño de buffer
-const bool DROP_OLDEST_ON_FULL = true;           // true: descarta más viejo si se llena
+const uint16_t QUEUE_SIZE = 256;
+const bool DROP_OLDEST_ON_FULL = true;
 
 volatile uint16_t qData[QUEUE_SIZE];
 volatile uint16_t qCount = 0;
@@ -28,9 +43,9 @@ volatile uint16_t qHead  = 0;
 volatile uint16_t qTail  = 0;
 
 // ---------- Ritmo de envío ----------
-unsigned long lastSendMs = 0;                    // último envío realizado
+unsigned long lastSendMs = 0;
 
-// Anti-duplicado corto (mismo tag muy pegado)
+// Anti-duplicado corto
 uint16_t lastCardSeen = 0;
 unsigned long lastCardSeenMs = 0;
 
@@ -46,12 +61,11 @@ inline bool queuePush(uint16_t v) {
   noInterrupts();
   if (qCount >= QUEUE_SIZE) {
     if (DROP_OLDEST_ON_FULL) {
-      // descarta el más viejo
       qTail = (qTail + 1) % QUEUE_SIZE;
       qCount--;
     } else {
       interrupts();
-      return false; // cola llena y no queremos soltar
+      return false;
     }
   }
   qData[qHead] = v;
@@ -71,9 +85,17 @@ inline bool queuePop(uint16_t &v) {
   return true;
 }
 
-void blinkOK() {
-  digitalWrite(LED_BUILTIN, HIGH); delay(60);
+// ---------- Blink helpers ----------
+void blinkReadOnce() {             // Lectura OK -> en cola
+  digitalWrite(LED_BUILTIN, HIGH); delay(70);
   digitalWrite(LED_BUILTIN, LOW);
+}
+
+void blinkSendDouble() {           // Envío a GPS -> doble parpadeo
+  for (int i = 0; i < 2; ++i) {
+    digitalWrite(LED_BUILTIN, HIGH); delay(60);
+    digitalWrite(LED_BUILTIN, LOW);  delay(60);
+  }
 }
 
 void blinkError3x() {
@@ -85,12 +107,14 @@ void blinkError3x() {
 
 // ---------- ISRs ----------
 void IRAM_ATTR ISR_data0() {
+  if (!acceptEdge()) return;
   if (bitIndex < 26) {
     bitBuffer[bitIndex++] = '0';
     lastBitTimeMs = millis();
   }
 }
 void IRAM_ATTR ISR_data1() {
+  if (!acceptEdge()) return;
   if (bitIndex < 26) {
     bitBuffer[bitIndex++] = '1';
     lastBitTimeMs = millis();
@@ -111,18 +135,21 @@ void setup() {
   memset((void*)bitBuffer, 0, sizeof(bitBuffer));
   queueClear();
 
-  lastSendMs = millis(); // arranca el timer de envío
+  lastSendMs = millis();
 }
 
 void loop() {
   static char localBuffer[27];
 
-  // ----- Reset por frame incompleto -----
+  // --- Snapshot seguro de estado compartido ---
+  byte idx;
+  unsigned long lastMs;
   noInterrupts();
-  byte idx = bitIndex;
-  unsigned long lastMs = lastBitTimeMs;
+  idx    = bitIndex;
+  lastMs = lastBitTimeMs;
   interrupts();
 
+  // ----- Reset por frame incompleto -----
   if (idx > 0 && idx < 26 && (millis() - lastMs > PARTIAL_TIMEOUT_MS)) {
     noInterrupts();
     bitIndex = 0;
@@ -131,12 +158,16 @@ void loop() {
     blinkError3x();
   }
 
-  // ----- Procesar frame completo -----
+  // --- Tomar otro snapshot para “frame completo” ---
   noInterrupts();
-  idx = bitIndex;
+  idx    = bitIndex;
   lastMs = lastBitTimeMs;
+  interrupts();
+
+  // ----- Procesar frame completo -----
   if (idx == 26 && (millis() - lastMs > COMPLETE_GAP_MS)) {
-    strncpy(localBuffer, (const char*)bitBuffer, 26);
+    noInterrupts();
+    for (byte i = 0; i < 26; ++i) localBuffer[i] = bitBuffer[i];
     localBuffer[26] = '\0';
     bitIndex = 0;
     memset((void*)bitBuffer, 0, sizeof(bitBuffer));
@@ -145,19 +176,16 @@ void loop() {
     unsigned long raw = strtoul(localBuffer, NULL, 2);
     uint16_t cardNumber = (raw >> 1) & 0xFFFF;
 
-    // Anti-duplicado corto (mismo tag dentro de ventana)
     unsigned long now = millis();
     if (!(cardNumber == lastCardSeen && (now - lastCardSeenMs) < DUP_WINDOW_MS)) {
       if (queuePush(cardNumber)) {
         lastCardSeen = cardNumber;
         lastCardSeenMs = now;
-        blinkOK();
+        blinkReadOnce();   // <-- parpadeo único al encolar
       } else {
-        blinkError3x(); // cola llena
+        blinkError3x();    // cola llena
       }
     }
-  } else {
-    interrupts();
   }
 
   // ----- Enviar 1 tag cada SEND_INTERVAL_MS -----
@@ -166,10 +194,8 @@ void loop() {
     if (queuePop(card)) {
       Serial.print(card);
       Serial.print("\r\n");
-      lastSendMs = millis(); // reinicia intervalo tras enviar 1
-    } else {
-      // No hay nada que enviar; igual avanza para no quedar “pegado”
-      lastSendMs = millis();
+      blinkSendDouble();   // <-- doble parpadeo al enviar
     }
+    lastSendMs = millis();
   }
 }
